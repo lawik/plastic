@@ -7,13 +7,13 @@ defmodule Plastic.Application do
 
   @impl true
   def start(_type, _args) do
+    {:ok, project} = Plastic.Project.open(Path.join(File.cwd!(), "sample"))
+
     children = [
       PlasticWeb.Telemetry,
       {DNSCluster, query: Application.get_env(:plastic, :dns_cluster_query) || :ignore},
       {Phoenix.PubSub, name: Plastic.PubSub},
-      # Start a worker by calling: Plastic.Worker.start_link(arg)
-      # {Plastic.Worker, arg},
-      # Start to serve requests, typically the last entry
+      {Plastic.Index, project: project},
       PlasticWeb.Endpoint
     ]
 

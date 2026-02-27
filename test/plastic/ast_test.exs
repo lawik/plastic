@@ -479,6 +479,438 @@ defmodule Plastic.ASTTest do
     end
   end
 
+  describe "defstruct module name" do
+    test "defstruct label includes parent module name" do
+      nodes =
+        analyze("""
+        defmodule MyApp.User do
+          defstruct name: "", age: 0
+        end
+        """)
+
+      [%Node{children: [%Node{kind: :defstruct, name: name}]}] = nodes
+      assert name =~ "MyApp.User"
+      assert name =~ "name:"
+    end
+
+    test "defstruct is not expandable" do
+      nodes =
+        analyze("""
+        defmodule Foo do
+          defstruct [:a, :b]
+        end
+        """)
+
+      [%Node{children: [%Node{kind: :defstruct, ast: ast}]}] = nodes
+      assert ast == nil
+    end
+  end
+
+  describe "function body breakdown" do
+    test "one-liner function has no body children" do
+      nodes =
+        analyze("""
+        defmodule Foo do
+          def bar(x) when is_integer(x), do: x * 2
+        end
+        """)
+
+      [%Node{children: [%Node{kind: :function, children: []}]}] = nodes
+    end
+
+    test "multi-expression function body is broken down" do
+      nodes =
+        analyze("""
+        defmodule Foo do
+          def bar(opts) do
+            name = Keyword.get(opts, :name)
+            Logger.info(name)
+            {:ok, name}
+          end
+        end
+        """)
+
+      [%Node{children: [%Node{kind: :function, children: children}]}] = nodes
+      assert length(children) == 3
+      assert [%Node{kind: :match}, %Node{kind: :expression}, %Node{kind: :expression}] = children
+    end
+
+    test "multi-clause function has body children per clause" do
+      nodes =
+        analyze("""
+        defmodule Foo do
+          def process(:ok) do
+            x = 1
+            Logger.info("ok")
+            x
+          end
+
+          def process(:error) do
+            Logger.error("bad")
+            :error
+          end
+        end
+        """)
+
+      [%Node{children: [%Node{kind: :function, children: clauses}]}] = nodes
+      assert length(clauses) == 2
+      [clause1, clause2] = clauses
+      assert length(clause1.children) == 3
+      assert length(clause2.children) == 2
+    end
+  end
+
+  describe "pipe breakdown" do
+    test "pipe chain is flattened into steps" do
+      nodes =
+        analyze("""
+        defmodule Foo do
+          def bar(items) do
+            items
+            |> Enum.filter(&(&1 > 0))
+            |> Enum.map(&to_string/1)
+            |> Enum.join(", ")
+          end
+        end
+        """)
+
+      [%Node{children: [%Node{children: [%Node{kind: :pipe, children: steps}]}]}] = nodes
+      assert length(steps) == 4
+      assert hd(steps).name =~ "|  "
+      assert Enum.at(steps, 1).name =~ "|> "
+    end
+
+    test "pipe assigned to variable wraps in match" do
+      nodes =
+        analyze("""
+        defmodule Foo do
+          def bar(items) do
+            result =
+              items
+              |> Enum.filter(&is_integer/1)
+              |> Enum.sum()
+
+            result
+          end
+        end
+        """)
+
+      [%Node{children: [%Node{children: [%Node{kind: :match, children: [%Node{kind: :pipe}]}, _]}]}] = nodes
+    end
+  end
+
+  describe "case breakdown" do
+    test "case expression has clause children" do
+      nodes =
+        analyze("""
+        defmodule Foo do
+          def bar(x) do
+            case x do
+              :a -> 1
+              :b -> 2
+              _ -> 0
+            end
+          end
+        end
+        """)
+
+      [%Node{children: [%Node{children: [%Node{kind: :case_expr, name: name, children: clauses}]}]}] = nodes
+      assert name == "x"
+      assert length(clauses) == 3
+      assert Enum.all?(clauses, &(&1.kind == :clause))
+    end
+  end
+
+  describe "if/unless breakdown" do
+    test "if expression has do/else blocks" do
+      nodes =
+        analyze("""
+        defmodule Foo do
+          def bar(x) do
+            if x > 0 do
+              :positive
+            else
+              :non_positive
+            end
+          end
+        end
+        """)
+
+      [%Node{children: [%Node{children: [%Node{kind: :if_expr, name: name, children: blocks}]}]}] = nodes
+      assert name == "x > 0"
+      block_names = Enum.map(blocks, & &1.name)
+      assert "do" in block_names
+      assert "else" in block_names
+    end
+  end
+
+  describe "with breakdown" do
+    test "with expression has clause and block children" do
+      nodes =
+        analyze("""
+        defmodule Foo do
+          def bar(x) do
+            with {:ok, a} <- fetch(x),
+                 {:ok, b} <- process(a) do
+              {:ok, b}
+            else
+              {:error, r} -> {:error, r}
+            end
+          end
+        end
+        """)
+
+      [%Node{children: [%Node{children: [%Node{kind: :with_expr, name: "", children: children}]}]}] = nodes
+      with_clauses = Enum.filter(children, &(&1.kind == :with_clause))
+      blocks = Enum.filter(children, &(&1.kind == :block))
+      assert length(with_clauses) == 2
+      assert length(blocks) == 2
+    end
+  end
+
+  describe "try breakdown" do
+    test "try expression has do/rescue/after blocks" do
+      nodes =
+        analyze("""
+        defmodule Foo do
+          def bar(x) do
+            try do
+              risky(x)
+            rescue
+              RuntimeError -> :error
+            after
+              cleanup()
+            end
+          end
+        end
+        """)
+
+      [%Node{children: [%Node{children: [%Node{kind: :try_expr, name: "", children: blocks}]}]}] = nodes
+      block_names = Enum.map(blocks, & &1.name)
+      assert "do" in block_names
+      assert "rescue" in block_names
+      assert "after" in block_names
+    end
+  end
+
+  describe "receive breakdown" do
+    test "receive expression has do/after blocks" do
+      nodes =
+        analyze("""
+        defmodule Foo do
+          def bar do
+            receive do
+              {:msg, data} -> data
+              :ping -> :pong
+            after
+              5000 -> :timeout
+            end
+          end
+        end
+        """)
+
+      [%Node{children: [%Node{children: [%Node{kind: :receive_expr, name: "", children: blocks}]}]}] = nodes
+      block_names = Enum.map(blocks, & &1.name)
+      assert "do" in block_names
+      assert "after" in block_names
+    end
+  end
+
+  describe "for breakdown" do
+    test "for comprehension has generator and block children" do
+      nodes =
+        analyze("""
+        defmodule Foo do
+          def bar(items) do
+            for item <- items,
+                item != nil do
+              item * 2
+            end
+          end
+        end
+        """)
+
+      [%Node{children: [%Node{children: [%Node{kind: :for_expr, name: "", children: children}]}]}] = nodes
+      blocks = Enum.filter(children, &(&1.kind == :block))
+      generators = Enum.filter(children, &(&1.kind == :expression))
+      assert length(generators) >= 1
+      assert length(blocks) == 1
+    end
+  end
+
+  describe "fn breakdown" do
+    test "anonymous function has clause children" do
+      nodes =
+        analyze("""
+        defmodule Foo do
+          def bar do
+            fn
+              :a -> 1
+              :b -> 2
+            end
+          end
+        end
+        """)
+
+      [%Node{children: [%Node{children: [%Node{kind: :fn_expr, name: "", children: clauses}]}]}] = nodes
+      assert length(clauses) == 2
+      assert Enum.all?(clauses, &(&1.kind == :clause))
+    end
+  end
+
+  describe "leaf nodes not expandable" do
+    test "typespecs have ast: nil" do
+      nodes =
+        analyze("""
+        defmodule Foo do
+          @type t :: :ok
+          @spec bar() :: :ok
+        end
+        """)
+
+      [%Node{children: children}] = nodes
+      assert Enum.all?(children, &(&1.ast == nil))
+    end
+
+    test "attributes have ast: nil" do
+      nodes =
+        analyze("""
+        defmodule Foo do
+          @custom 42
+        end
+        """)
+
+      [%Node{children: [%Node{kind: :attribute, ast: nil}]}] = nodes
+    end
+  end
+
+  describe "extract_definitions/1" do
+    defp extract_defs(code) do
+      {:ok, ast} = Parser.parse_string(code)
+      AST.extract_definitions(ast)
+    end
+
+    test "extracts module definition" do
+      defs = extract_defs("defmodule Foo.Bar do\nend")
+      assert [%{kind: :module, name: "Foo.Bar", line: 1}] = defs
+    end
+
+    test "extracts def and defp" do
+      defs =
+        extract_defs("""
+        defmodule Foo do
+          def bar(x), do: x
+          defp baz(x, y), do: {x, y}
+        end
+        """)
+
+      assert [
+               %{kind: :module, name: "Foo"},
+               %{kind: :def, name: :bar, arity: 1},
+               %{kind: :defp, name: :baz, arity: 2}
+             ] = defs
+    end
+
+    test "extracts function with guard" do
+      defs =
+        extract_defs("""
+        defmodule Foo do
+          def bar(x) when is_integer(x), do: x
+        end
+        """)
+
+      assert [%{kind: :module}, %{kind: :def, name: :bar, arity: 1}] = defs
+    end
+
+    test "extracts defmacro and defmacrop" do
+      defs =
+        extract_defs("""
+        defmodule Foo do
+          defmacro my_macro(arg), do: arg
+          defmacrop private_macro(arg), do: arg
+        end
+        """)
+
+      assert [
+               %{kind: :module},
+               %{kind: :defmacro, name: :my_macro, arity: 1},
+               %{kind: :defmacrop, name: :private_macro, arity: 1}
+             ] = defs
+    end
+
+    test "extracts defstruct" do
+      defs =
+        extract_defs("""
+        defmodule Foo do
+          defstruct [:a, :b]
+        end
+        """)
+
+      assert [%{kind: :module, name: "Foo"}, %{kind: :struct, module: "Foo"}] = defs
+    end
+
+    test "extracts @type" do
+      defs =
+        extract_defs("""
+        defmodule Foo do
+          @type status :: :ok | :error
+        end
+        """)
+
+      assert [%{kind: :module}, %{kind: :type, name: :status, arity: 0}] = defs
+    end
+
+    test "extracts defguard" do
+      defs =
+        extract_defs("""
+        defmodule Foo do
+          defguard is_positive(n) when is_integer(n) and n > 0
+        end
+        """)
+
+      assert [%{kind: :module}, %{kind: :defguard, name: :is_positive, arity: 1}] = defs
+    end
+
+    test "extracts nested module with fully qualified name" do
+      defs =
+        extract_defs("""
+        defmodule Foo do
+          defmodule Bar do
+            def baz, do: :ok
+          end
+        end
+        """)
+
+      assert [
+               %{kind: :module, name: "Foo"},
+               %{kind: :module, name: "Foo.Bar"},
+               %{kind: :def, name: :baz, module: "Foo.Bar"}
+             ] = defs
+    end
+
+    test "includes line numbers" do
+      defs =
+        extract_defs("""
+        defmodule Foo do
+          def bar, do: :ok
+        end
+        """)
+
+      assert [%{kind: :module, line: 1}, %{kind: :def, line: 2}] = defs
+    end
+
+    test "extracts @callback" do
+      defs =
+        extract_defs("""
+        defmodule Foo do
+          @callback on_event(term()) :: :ok
+        end
+        """)
+
+      assert [%{kind: :module}, %{kind: :callback, name: :on_event, arity: 1}] = defs
+    end
+  end
+
   defp collect_ids(nodes) do
     Enum.flat_map(nodes, fn node ->
       [node.id | collect_ids(node.children)]

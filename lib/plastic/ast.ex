@@ -26,6 +26,82 @@ defmodule Plastic.AST do
   end
 
   @doc """
+  Extract a flat list of definition maps from raw AST for indexing.
+  Returns entries like `%{kind: :module, name: "Foo.Bar", line: 1}`.
+  """
+  def extract_definitions(ast) do
+    extract_defs(ast, nil, []) |> Enum.reverse()
+  end
+
+  defp extract_defs({:defmodule, meta, [alias_ast, [do: body]]}, current_module, acc) do
+    short_name = module_name(alias_ast)
+
+    mod =
+      if current_module && !String.contains?(short_name, ".") do
+        current_module <> "." <> short_name
+      else
+        short_name
+      end
+
+    line = Keyword.get(meta, :line)
+    acc = [%{kind: :module, name: mod, line: line} | acc]
+    extract_defs(body, mod, acc)
+  end
+
+  defp extract_defs({def_kind, meta, [{:when, _, [{name, _, args} | _]} | _]}, current_module, acc)
+       when def_kind in [:def, :defp, :defmacro, :defmacrop] do
+    arity = if is_list(args), do: length(args), else: 0
+    line = Keyword.get(meta, :line)
+    [%{kind: def_kind, module: current_module, name: name, arity: arity, line: line} | acc]
+  end
+
+  defp extract_defs({def_kind, meta, [{name, _, args} | _]}, current_module, acc)
+       when def_kind in [:def, :defp, :defmacro, :defmacrop] do
+    arity = if is_list(args), do: length(args), else: 0
+    line = Keyword.get(meta, :line)
+    [%{kind: def_kind, module: current_module, name: name, arity: arity, line: line} | acc]
+  end
+
+  defp extract_defs({guard_kind, meta, [{:when, _, [{name, _, args}, _guard]}]}, current_module, acc)
+       when guard_kind in [:defguard, :defguardp] do
+    arity = if is_list(args), do: length(args), else: 0
+    line = Keyword.get(meta, :line)
+    [%{kind: guard_kind, module: current_module, name: name, arity: arity, line: line} | acc]
+  end
+
+  defp extract_defs({:defstruct, meta, _}, current_module, acc) do
+    line = Keyword.get(meta, :line)
+    [%{kind: :struct, module: current_module, line: line} | acc]
+  end
+
+  defp extract_defs({:@, meta, [{type_kind, _, [{:"::", _, [{name, _, args} | _]} | _]}]}, current_module, acc)
+       when type_kind in [:type, :typep, :opaque] do
+    arity = if is_list(args), do: length(args), else: 0
+    line = Keyword.get(meta, :line)
+    [%{kind: type_kind, module: current_module, name: name, arity: arity, line: line} | acc]
+  end
+
+  defp extract_defs({:@, meta, [{type_kind, _, [{name, _, args}]}]}, current_module, acc)
+       when type_kind in [:type, :typep, :opaque] do
+    arity = if is_list(args), do: length(args), else: 0
+    line = Keyword.get(meta, :line)
+    [%{kind: type_kind, module: current_module, name: name, arity: arity, line: line} | acc]
+  end
+
+  defp extract_defs({:@, meta, [{cb_kind, _, [{:"::", _, [{name, _, args} | _]} | _]}]}, current_module, acc)
+       when cb_kind in [:callback, :macrocallback] do
+    arity = if is_list(args), do: length(args), else: 0
+    line = Keyword.get(meta, :line)
+    [%{kind: cb_kind, module: current_module, name: name, arity: arity, line: line} | acc]
+  end
+
+  defp extract_defs({:__block__, _, children}, current_module, acc) do
+    Enum.reduce(children, acc, fn child, acc -> extract_defs(child, current_module, acc) end)
+  end
+
+  defp extract_defs(_, _current_module, acc), do: acc
+
+  @doc """
   Analyze a top-level AST and return a tree of Node structs grouped logically.
   """
   def analyze(ast) do
@@ -330,7 +406,7 @@ defmodule Plastic.AST do
     %Node{
       id: id,
       kind: :case_expr,
-      name: "case #{Macro.to_string(subject)}",
+      name: Macro.to_string(subject),
       meta: extract_meta(ast),
       ast: nil,
       children: analyze_clauses(clauses, id),
@@ -345,7 +421,7 @@ defmodule Plastic.AST do
     %Node{
       id: id,
       kind: :if_expr,
-      name: "if #{Macro.to_string(condition)}",
+      name: Macro.to_string(condition),
       meta: extract_meta(ast),
       ast: nil,
       children: analyze_block_children(blocks, id),
@@ -360,7 +436,7 @@ defmodule Plastic.AST do
     %Node{
       id: id,
       kind: :unless_expr,
-      name: "unless #{Macro.to_string(condition)}",
+      name: Macro.to_string(condition),
       meta: extract_meta(ast),
       ast: nil,
       children: analyze_block_children(blocks, id),
@@ -375,7 +451,7 @@ defmodule Plastic.AST do
     %Node{
       id: id,
       kind: :cond_expr,
-      name: "cond",
+      name: "",
       meta: extract_meta(ast),
       ast: nil,
       children: analyze_clauses(clauses, id),
@@ -408,7 +484,7 @@ defmodule Plastic.AST do
     %Node{
       id: id,
       kind: :with_expr,
-      name: "with",
+      name: "",
       meta: extract_meta(ast),
       ast: nil,
       children: with_clause_children ++ block_children,
@@ -423,7 +499,7 @@ defmodule Plastic.AST do
     %Node{
       id: id,
       kind: :try_expr,
-      name: "try",
+      name: "",
       meta: extract_meta(ast),
       ast: nil,
       children: analyze_block_children(blocks, id),
@@ -438,7 +514,7 @@ defmodule Plastic.AST do
     %Node{
       id: id,
       kind: :receive_expr,
-      name: "receive",
+      name: "",
       meta: extract_meta(ast),
       ast: nil,
       children: analyze_block_children(blocks, id),
@@ -471,7 +547,7 @@ defmodule Plastic.AST do
     %Node{
       id: id,
       kind: :for_expr,
-      name: "for",
+      name: "",
       meta: extract_meta(ast),
       ast: nil,
       children: gen_children ++ block_children,
@@ -486,7 +562,7 @@ defmodule Plastic.AST do
     %Node{
       id: id,
       kind: :fn_expr,
-      name: "fn",
+      name: "",
       meta: extract_meta(ast),
       ast: nil,
       children: analyze_clauses(clauses, id),

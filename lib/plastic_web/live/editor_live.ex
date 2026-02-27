@@ -35,8 +35,9 @@ defmodule PlasticWeb.EditorLive do
     {:noreply, socket}
   end
 
-  def handle_params(_params, _uri, socket) do
-    {:noreply, socket}
+  def handle_params(params, _uri, socket) do
+    expanded_from_params = parse_expanded(params)
+    {:noreply, assign(socket, expanded: expanded_from_params)}
   end
 
   @impl true
@@ -46,8 +47,20 @@ defmodule PlasticWeb.EditorLive do
   end
 
   def handle_event("toggle_node", %{"id" => id}, socket) do
-    expanded = toggle_in_set(socket.assigns.expanded, id)
-    {:noreply, patch_with_expanded(socket, socket.assigns.selected_file, expanded)}
+    if MapSet.member?(socket.assigns.expanded, id) do
+      expanded = MapSet.delete(socket.assigns.expanded, id)
+      {:noreply, patch_with_expanded(socket, socket.assigns.selected_file, expanded)}
+    else
+      expanded = MapSet.put(socket.assigns.expanded, id)
+
+      expanded =
+        case find_node(socket.assigns.ast_tree || [], id) do
+          nil -> expanded
+          node -> auto_expand_single_children(expanded, node)
+        end
+
+      {:noreply, patch_with_expanded(socket, socket.assigns.selected_file, expanded)}
+    end
   end
 
   def handle_event("toggle_dir", %{"path" => path}, socket) do
@@ -61,6 +74,19 @@ defmodule PlasticWeb.EditorLive do
     {:noreply, patch_with_expanded(socket, socket.assigns.selected_file, expanded)}
   end
 
+  def handle_event("jump_to_definition", %{"module" => module_name}, socket) do
+    Plastic.Index.ensure_indexed(module_name)
+
+    case Plastic.Index.lookup_module(module_name) do
+      {:ok, %{file: file_path}} ->
+        dir_ids = parent_dir_ids(file_path)
+        {:noreply, patch_with_expanded(socket, file_path, dir_ids)}
+
+      :error ->
+        {:noreply, socket}
+    end
+  end
+
   def handle_event("collapse_all", _, socket) do
     # Keep dir expansions, clear AST node expansions
     dirs = socket.assigns.expanded |> Enum.filter(&String.starts_with?(&1, "dir:")) |> MapSet.new()
@@ -71,7 +97,10 @@ defmodule PlasticWeb.EditorLive do
     if MapSet.member?(set, id), do: MapSet.delete(set, id), else: MapSet.put(set, id)
   end
 
-  defp patch_with_expanded(socket, nil, _expanded), do: push_patch(socket, to: ~p"/")
+  defp patch_with_expanded(socket, nil, expanded) do
+    params = %{expanded: encode_expanded(expanded)}
+    push_patch(socket, to: ~p"/?#{params}", replace: true)
+  end
 
   defp patch_with_expanded(socket, path, expanded) do
     params = %{path: path, expanded: encode_expanded(expanded)}
@@ -79,7 +108,11 @@ defmodule PlasticWeb.EditorLive do
   end
 
   defp open_file(socket, path, expanded_from_params) do
-    abs_path = Path.join(socket.assigns.project.root_path, path)
+    abs_path =
+      if Path.type(path) == :absolute,
+        do: path,
+        else: Path.join(socket.assigns.project.root_path, path)
+
     dir_ids = parent_dir_ids(path)
 
     case Parser.parse_file(abs_path) do
@@ -128,6 +161,21 @@ defmodule PlasticWeb.EditorLive do
       [node.id | collect_all_node_ids(node.children)]
     end)
   end
+
+  defp find_node([], _id), do: nil
+
+  defp find_node([%{id: id} = node | _rest], id), do: node
+
+  defp find_node([%{children: children} | rest], id) do
+    find_node(children, id) || find_node(rest, id)
+  end
+
+  defp auto_expand_single_children(expanded, %{children: [only_child]}) do
+    expanded = MapSet.put(expanded, only_child.id)
+    auto_expand_single_children(expanded, only_child)
+  end
+
+  defp auto_expand_single_children(expanded, _), do: expanded
 
   defp encode_expanded(expanded) do
     expanded |> MapSet.to_list() |> Enum.join(",")
@@ -279,6 +327,17 @@ defmodule PlasticWeb.EditorLive do
           <% end %>
         </span>
 
+        <!-- jump arrow -->
+        <button
+          :if={jumpable_module(@node)}
+          phx-click="jump_to_definition"
+          phx-value-module={jumpable_module(@node)}
+          class="text-xs text-primary/60 hover:text-primary cursor-pointer ml-1"
+          title={"Jump to #{jumpable_module(@node)}"}
+        >
+          &rarr;
+        </button>
+
         <!-- line number -->
         <span :if={@node.meta[:line]} class="text-xs text-base-content/30 ml-auto shrink-0">
           L{@node.meta[:line]}
@@ -309,9 +368,17 @@ defmodule PlasticWeb.EditorLive do
     """
   end
 
+  defp node_source(%{kind: kind, ast: ast}) when kind in [:function, :function_clause, :callback_impl] and ast != nil do
+    Macro.to_string(function_body(ast))
+  end
+
   defp node_source(%{ast: ast}) when ast != nil do
     Macro.to_string(ast)
   end
+
+  defp function_body({_def_kind, _, [{:when, _, _} | [[do: body] | _]]}), do: body
+  defp function_body({_def_kind, _, [_ | [[do: body] | _]]}), do: body
+  defp function_body(ast), do: ast
 
   defp highlight_block(code) do
     case Lumis.highlight(code, language: "elixir") do
@@ -343,6 +410,12 @@ defmodule PlasticWeb.EditorLive do
       _ -> text
     end
   end
+
+  defp jumpable_module(%{kind: kind, name: name})
+       when kind in [:use, :import, :alias, :require, :behaviour],
+       do: name
+
+  defp jumpable_module(_), do: nil
 
   defp kind_label(%{kind: kind, meta: meta}) when kind in [:function, :function_clause, :callback_impl] do
     case Map.get(meta, :def_kind) do
