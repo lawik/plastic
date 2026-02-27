@@ -17,7 +17,7 @@ defmodule PlasticWeb.Router do
   scope "/", PlasticWeb do
     pipe_through :browser
 
-    get "/", PageController, :home
+    live "/", EditorLive
   end
 
   # Other scopes may use custom stacks.
