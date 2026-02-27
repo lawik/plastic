@@ -294,6 +294,55 @@ defmodule Sample.KitchenSink do
     :ets.insert(table, {key, value, expires_at})
   end
 
+  # Combined expression showcase
+
+  def process_and_report(items, opts) do
+    label = Keyword.get(opts, :label, "batch")
+    timeout = Keyword.get(opts, :timeout, @default_timeout)
+
+    filtered =
+      items
+      |> filter(&(&1 != nil))
+      |> map(&transform/1)
+
+    result =
+      with {:ok, data} <- fetch(:memory),
+           merged = Map.merge(data, %{items: filtered}),
+           {:ok, _} <- validate(map_size(merged)) do
+        case Keyword.get(opts, :format) do
+          :json ->
+            {:ok, Jason.encode!(merged)}
+
+          :raw ->
+            {:ok, merged}
+
+          nil ->
+            {:ok, inspect(merged)}
+        end
+      else
+        {:error, reason} -> {:error, reason}
+        :error -> {:error, :unknown}
+      end
+
+    status =
+      if result == {:ok, _} do
+        :success
+      else
+        :failure
+      end
+
+    response =
+      receive do
+        {:ack, ref} -> {:confirmed, ref}
+        :cancel -> :cancelled
+      after
+        timeout -> :timed_out
+      end
+
+    Logger.info("#{label}: #{status}, response: #{inspect(response)}")
+    {result, response}
+  end
+
   # Callbacks
 
   @callback on_event(event :: term(), state :: term()) :: {:ok, term()} | {:error, term()}

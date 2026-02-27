@@ -46,21 +46,21 @@ defmodule Plastic.AST do
     Plastic.AST.Block.AnnotatedFunction
   ]
 
-  defp analyze_expressions(expressions, prefix) do
+  defp analyze_expressions(expressions, prefix, context \\ %{}) do
     expressions
     |> Enum.with_index()
     |> Enum.flat_map(fn {expr, idx} ->
-      analyze_expression(expr, prefix, idx)
+      analyze_expression(expr, prefix, idx, context)
     end)
     |> group_function_clauses()
     |> apply_blocks(@default_blocks)
   end
 
-  defp analyze_expression({:defmodule, meta, [alias_ast, [do: body]]}, prefix, _idx) do
+  defp analyze_expression({:defmodule, meta, [alias_ast, [do: body]]}, prefix, _idx, _context) do
     mod_name = module_name(alias_ast)
     id = "#{prefix}/mod:#{mod_name}"
 
-    children = analyze_module_body(body, id)
+    children = analyze_module_body(body, id, %{module_name: mod_name})
 
     [
       %Node{
@@ -80,7 +80,8 @@ defmodule Plastic.AST do
   defp analyze_expression(
          {def_kind, meta, [{:when, _, [{name, _, args} | _]} | _]} = ast,
          prefix,
-         idx
+         idx,
+         _context
        )
        when def_kind in [:def, :defp, :defmacro, :defmacrop] do
     arity = if is_list(args), do: length(args), else: 0
@@ -94,13 +95,13 @@ defmodule Plastic.AST do
         name: label,
         meta: Map.merge(extract_meta(meta), %{def_kind: def_kind, fun_name: name, arity: arity}),
         ast: ast,
-        children: [],
+        children: extract_body_children(ast, id),
         collapsed: true
       }
     ]
   end
 
-  defp analyze_expression({def_kind, meta, [{name, _, args} | _]} = ast, prefix, idx)
+  defp analyze_expression({def_kind, meta, [{name, _, args} | _]} = ast, prefix, idx, _context)
        when def_kind in [:def, :defp, :defmacro, :defmacrop] do
     arity = if is_list(args), do: length(args), else: 0
     label = "#{name}/#{arity}"
@@ -113,13 +114,13 @@ defmodule Plastic.AST do
         name: label,
         meta: Map.merge(extract_meta(meta), %{def_kind: def_kind, fun_name: name, arity: arity}),
         ast: ast,
-        children: [],
+        children: extract_body_children(ast, id),
         collapsed: true
       }
     ]
   end
 
-  defp analyze_expression({:@, meta, [{attr_name, _, attr_args}]} = ast, prefix, idx) do
+  defp analyze_expression({:@, meta, [{attr_name, _, attr_args}]}, prefix, idx, _context) do
     kind = categorize_attribute(attr_name)
     id = "#{prefix}/#{kind}:#{attr_name}:#{idx}"
 
@@ -135,15 +136,16 @@ defmodule Plastic.AST do
         kind: kind,
         name: label,
         meta: Map.put(extract_meta(meta), :attr_name, attr_name),
-        ast: ast,
+        ast: nil,
         children: [],
         collapsed: true
       }
     ]
   end
 
-  defp analyze_expression({:defstruct, meta, [fields]} = ast, prefix, idx) do
-    label = struct_label(fields)
+  defp analyze_expression({:defstruct, meta, [fields]}, prefix, idx, context) do
+    mod_prefix = if context[:module_name], do: "#{context.module_name} ", else: ""
+    label = mod_prefix <> struct_label(fields)
     id = "#{prefix}/defstruct:#{idx}"
 
     [
@@ -152,14 +154,14 @@ defmodule Plastic.AST do
         kind: :defstruct,
         name: label,
         meta: extract_meta(meta),
-        ast: ast,
+        ast: nil,
         children: [],
         collapsed: true
       }
     ]
   end
 
-  defp analyze_expression({guard_kind, meta, [{:when, _, [{name, _, args}, _guard]}]} = ast, prefix, idx)
+  defp analyze_expression({guard_kind, meta, [{:when, _, [{name, _, args}, _guard]}]} = ast, prefix, idx, _context)
        when guard_kind in [:defguard, :defguardp] do
     arity = if is_list(args), do: length(args), else: 0
     label = "#{name}/#{arity}"
@@ -178,7 +180,7 @@ defmodule Plastic.AST do
     ]
   end
 
-  defp analyze_expression({directive, meta, args} = ast, prefix, idx)
+  defp analyze_expression({directive, meta, args} = ast, prefix, idx, _context)
        when directive in [:use, :import, :alias, :require] do
     label = directive_label(args)
     id = "#{prefix}/#{directive}:#{idx}"
@@ -197,7 +199,7 @@ defmodule Plastic.AST do
     ]
   end
 
-  defp analyze_expression(ast, prefix, idx) do
+  defp analyze_expression(ast, prefix, idx, _context) do
     label = Macro.to_string(ast)
 
     id = "#{prefix}/expr:#{idx}"
@@ -215,12 +217,442 @@ defmodule Plastic.AST do
     ]
   end
 
-  defp analyze_module_body({:__block__, _meta, children}, prefix) do
-    analyze_expressions(children, prefix)
+  defp analyze_module_body({:__block__, _meta, children}, prefix, context) do
+    analyze_expressions(children, prefix, context)
   end
 
-  defp analyze_module_body(ast, prefix) do
-    analyze_expressions([ast], prefix)
+  defp analyze_module_body(ast, prefix, context) do
+    analyze_expressions([ast], prefix, context)
+  end
+
+  # -- Function body breakdown --
+
+  # Extract body children from a function clause AST.
+  # Returns [] for one-liner bodies (single simple expression) so they keep showing code.
+  defp extract_body_children({_def_kind, _, [_ | [[do: body] | _]]}, id) do
+    analyze_body(body, id)
+  end
+
+  defp extract_body_children({_def_kind, _, [{:when, _, [_ | _]} | [[do: body] | _]]}, id) do
+    analyze_body(body, id)
+  end
+
+  defp extract_body_children(_, _id), do: []
+
+  defp analyze_body({:__block__, _, exprs}, prefix) do
+    exprs
+    |> Enum.with_index()
+    |> Enum.map(fn {expr, idx} -> analyze_body_expr(expr, prefix, idx) end)
+  end
+
+  defp analyze_body(expr, prefix) do
+    # Single expression — if it's a leaf (not a structured expression), return []
+    # so the function keeps showing code for one-liners
+    if structured_expr?(expr) do
+      [analyze_body_expr(expr, prefix, 0)]
+    else
+      []
+    end
+  end
+
+  @structured_tags [:|>, :case, :if, :unless, :cond, :with, :try, :receive, :for, :fn]
+
+  defp structured_expr?({tag, _, _}) when tag in @structured_tags, do: true
+  defp structured_expr?({:=, _, [_, rhs]}), do: structured_expr?(rhs)
+  defp structured_expr?(_), do: false
+
+  # Pipe chain
+  defp analyze_body_expr({:|>, _, _} = ast, prefix, idx) do
+    id = "#{prefix}/pipe:#{idx}"
+    steps = flatten_pipe(ast)
+    first_step = Macro.to_string(hd(steps))
+
+    children =
+      steps
+      |> Enum.with_index()
+      |> Enum.map(fn {step, i} ->
+        prefix_str = if i == 0, do: "|  ", else: "|> "
+
+        %Node{
+          id: "#{id}/step:#{i}",
+          kind: :expression,
+          name: prefix_str <> Macro.to_string(step),
+          meta: extract_meta(step),
+          ast: nil,
+          children: [],
+          collapsed: true
+        }
+      end)
+
+    %Node{
+      id: id,
+      kind: :pipe,
+      name: "#{first_step} |> ...",
+      meta: extract_meta(ast),
+      ast: nil,
+      children: children,
+      collapsed: true
+    }
+  end
+
+  # Match with structured RHS
+  defp analyze_body_expr({:=, _, [pattern, rhs]} = ast, prefix, idx) do
+    id = "#{prefix}/match:#{idx}"
+    pattern_str = Macro.to_string(pattern)
+
+    if structured_expr?(rhs) do
+      %Node{
+        id: id,
+        kind: :match,
+        name: "#{pattern_str} =",
+        meta: extract_meta(ast),
+        ast: nil,
+        children: [analyze_body_expr(rhs, id, 0)],
+        collapsed: true
+      }
+    else
+      %Node{
+        id: id,
+        kind: :match,
+        name: "#{pattern_str} = #{Macro.to_string(rhs)}",
+        meta: extract_meta(ast),
+        ast: nil,
+        children: [],
+        collapsed: true
+      }
+    end
+  end
+
+  # case
+  defp analyze_body_expr({:case, _, [subject, [do: clauses]]} = ast, prefix, idx) do
+    id = "#{prefix}/case:#{idx}"
+
+    %Node{
+      id: id,
+      kind: :case_expr,
+      name: "case #{Macro.to_string(subject)}",
+      meta: extract_meta(ast),
+      ast: nil,
+      children: analyze_clauses(clauses, id),
+      collapsed: true
+    }
+  end
+
+  # if
+  defp analyze_body_expr({:if, _, [condition | [blocks]]} = ast, prefix, idx) do
+    id = "#{prefix}/if:#{idx}"
+
+    %Node{
+      id: id,
+      kind: :if_expr,
+      name: "if #{Macro.to_string(condition)}",
+      meta: extract_meta(ast),
+      ast: nil,
+      children: analyze_block_children(blocks, id),
+      collapsed: true
+    }
+  end
+
+  # unless
+  defp analyze_body_expr({:unless, _, [condition | [blocks]]} = ast, prefix, idx) do
+    id = "#{prefix}/unless:#{idx}"
+
+    %Node{
+      id: id,
+      kind: :unless_expr,
+      name: "unless #{Macro.to_string(condition)}",
+      meta: extract_meta(ast),
+      ast: nil,
+      children: analyze_block_children(blocks, id),
+      collapsed: true
+    }
+  end
+
+  # cond
+  defp analyze_body_expr({:cond, _, [[do: clauses]]} = ast, prefix, idx) do
+    id = "#{prefix}/cond:#{idx}"
+
+    %Node{
+      id: id,
+      kind: :cond_expr,
+      name: "cond",
+      meta: extract_meta(ast),
+      ast: nil,
+      children: analyze_clauses(clauses, id),
+      collapsed: true
+    }
+  end
+
+  # with
+  defp analyze_body_expr({:with, _, args} = ast, prefix, idx) do
+    id = "#{prefix}/with:#{idx}"
+    {clauses, blocks} = split_clauses_and_blocks(args)
+
+    with_clause_children =
+      clauses
+      |> Enum.with_index()
+      |> Enum.map(fn {clause, i} ->
+        %Node{
+          id: "#{id}/clause:#{i}",
+          kind: :with_clause,
+          name: Macro.to_string(clause),
+          meta: extract_meta(clause),
+          ast: nil,
+          children: [],
+          collapsed: true
+        }
+      end)
+
+    block_children = analyze_block_children(blocks, id)
+
+    %Node{
+      id: id,
+      kind: :with_expr,
+      name: "with",
+      meta: extract_meta(ast),
+      ast: nil,
+      children: with_clause_children ++ block_children,
+      collapsed: true
+    }
+  end
+
+  # try
+  defp analyze_body_expr({:try, _, [blocks]} = ast, prefix, idx) do
+    id = "#{prefix}/try:#{idx}"
+
+    %Node{
+      id: id,
+      kind: :try_expr,
+      name: "try",
+      meta: extract_meta(ast),
+      ast: nil,
+      children: analyze_block_children(blocks, id),
+      collapsed: true
+    }
+  end
+
+  # receive
+  defp analyze_body_expr({:receive, _, [blocks]} = ast, prefix, idx) do
+    id = "#{prefix}/receive:#{idx}"
+
+    %Node{
+      id: id,
+      kind: :receive_expr,
+      name: "receive",
+      meta: extract_meta(ast),
+      ast: nil,
+      children: analyze_block_children(blocks, id),
+      collapsed: true
+    }
+  end
+
+  # for comprehension
+  defp analyze_body_expr({:for, _, args} = ast, prefix, idx) do
+    id = "#{prefix}/for:#{idx}"
+    {generators, blocks} = split_for_args(args)
+
+    gen_children =
+      generators
+      |> Enum.with_index()
+      |> Enum.map(fn {gen, i} ->
+        %Node{
+          id: "#{id}/gen:#{i}",
+          kind: :expression,
+          name: Macro.to_string(gen),
+          meta: extract_meta(gen),
+          ast: nil,
+          children: [],
+          collapsed: true
+        }
+      end)
+
+    block_children = analyze_block_children(blocks, id)
+
+    %Node{
+      id: id,
+      kind: :for_expr,
+      name: "for",
+      meta: extract_meta(ast),
+      ast: nil,
+      children: gen_children ++ block_children,
+      collapsed: true
+    }
+  end
+
+  # fn
+  defp analyze_body_expr({:fn, _, clauses} = ast, prefix, idx) do
+    id = "#{prefix}/fn:#{idx}"
+
+    %Node{
+      id: id,
+      kind: :fn_expr,
+      name: "fn",
+      meta: extract_meta(ast),
+      ast: nil,
+      children: analyze_clauses(clauses, id),
+      collapsed: true
+    }
+  end
+
+  # Fallback — leaf expression
+  defp analyze_body_expr(ast, prefix, idx) do
+    id = "#{prefix}/expr:#{idx}"
+
+    %Node{
+      id: id,
+      kind: :expression,
+      name: Macro.to_string(ast),
+      meta: extract_meta(ast),
+      ast: nil,
+      children: [],
+      collapsed: true
+    }
+  end
+
+  # Analyze `->` clauses (used by case, cond, receive, fn, with-else)
+  defp analyze_clauses(clauses, prefix) when is_list(clauses) do
+    clauses
+    |> Enum.with_index()
+    |> Enum.map(fn {{:->, _, [patterns, body]}, i} ->
+      id = "#{prefix}/clause:#{i}"
+      pattern_str = Enum.map_join(patterns, ", ", &Macro.to_string/1)
+
+      body_children = case body do
+        {:__block__, _, exprs} ->
+          exprs
+          |> Enum.with_index()
+          |> Enum.map(fn {expr, j} -> analyze_body_expr(expr, id, j) end)
+
+        expr ->
+          if structured_expr?(expr) do
+            [analyze_body_expr(expr, id, 0)]
+          else
+            []
+          end
+      end
+
+      %Node{
+        id: id,
+        kind: :clause,
+        name: pattern_str,
+        meta: %{},
+        ast: if(body_children == [], do: body),
+        children: body_children,
+        collapsed: true
+      }
+    end)
+  end
+
+  defp analyze_clauses(_, _prefix), do: []
+
+  # Analyze keyword blocks (do/else/rescue/catch/after)
+  defp analyze_block_children(blocks, prefix) when is_list(blocks) do
+    Enum.flat_map(blocks, fn {key, body} ->
+      id = "#{prefix}/block:#{key}"
+
+      children = case {key, body} do
+        {k, clauses} when k in [:rescue, :catch] and is_list(clauses) ->
+          analyze_clauses(clauses, id)
+
+        {_k, clauses} when is_list(clauses) ->
+          # do: [clause1, clause2] — list of -> clauses (e.g., receive/case do block)
+          if match?([{:->, _, _} | _], clauses) do
+            analyze_clauses(clauses, id)
+          else
+            clauses
+            |> Enum.with_index()
+            |> Enum.map(fn {expr, j} -> analyze_body_expr(expr, id, j) end)
+          end
+
+        {_k, {:__block__, _, exprs}} ->
+          exprs
+          |> Enum.with_index()
+          |> Enum.map(fn {expr, j} -> analyze_body_expr(expr, id, j) end)
+
+        {_k, nil} ->
+          []
+
+        {_k, expr} ->
+          if structured_expr?(expr) do
+            [analyze_body_expr(expr, id, 0)]
+          else
+            [%Node{
+              id: "#{id}/expr:0",
+              kind: :expression,
+              name: Macro.to_string(expr),
+              meta: extract_meta(expr),
+              ast: nil,
+              children: [],
+              collapsed: true
+            }]
+          end
+      end
+
+      if children == [] do
+        []
+      else
+        [%Node{
+          id: id,
+          kind: :block,
+          name: "#{key}",
+          meta: %{},
+          ast: nil,
+          children: children,
+          collapsed: true
+        }]
+      end
+    end)
+  end
+
+  defp analyze_block_children(_, _prefix), do: []
+
+  # Flatten nested pipe operators into a list of steps
+  defp flatten_pipe({:|>, _, [left, right]}) do
+    flatten_pipe(left) ++ [right]
+  end
+
+  defp flatten_pipe(other), do: [other]
+
+  # Split args into {non-block items, keyword blocks} for with/for expressions.
+  # The last element(s) that are keyword lists with keys like :do, :else, etc. are blocks.
+  defp split_clauses_and_blocks(args) do
+    case List.pop_at(args, -1) do
+      {last, rest} when is_list(last) and last != [] ->
+        if Keyword.keyword?(last) and Keyword.has_key?(last, :do) do
+          {rest, last}
+        else
+          {args, []}
+        end
+
+      _ ->
+        {args, []}
+    end
+  end
+
+  # Split `for` comprehension args into {generators, keyword_blocks}
+  defp split_for_args(args) do
+    case List.pop_at(args, -1) do
+      {last, rest} when is_list(last) and last != [] ->
+        if Keyword.keyword?(last) and Keyword.has_key?(last, :do) do
+          # Check if the item before last is also a keyword list (like [reduce: []])
+          case List.pop_at(rest, -1) do
+            {penult, rest2} when is_list(penult) and penult != [] ->
+              if Keyword.keyword?(penult) do
+                {rest2, penult ++ last}
+              else
+                {rest, last}
+              end
+
+            _ ->
+              {rest, last}
+          end
+        else
+          {args, []}
+        end
+
+      _ ->
+        {args, []}
+    end
   end
 
   # Group consecutive function clauses with the same name/arity into a parent function node

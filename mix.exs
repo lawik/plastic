@@ -41,6 +41,7 @@ defmodule Plastic.MixProject do
   # Type `mix help deps` for examples and options.
   defp deps do
     [
+      {:live_flow, "~> 0.2"},
       {:lumis, "~> 0.1"},
       {:mdex, "~> 0.11"},
       {:spitfire, "~> 0.3"},

@@ -86,11 +86,13 @@ defmodule PlasticWeb.EditorLive do
       {:ok, ast} ->
         nodes = AST.analyze(ast)
 
+        modules = Enum.filter(nodes, &(&1.kind == :module))
+
         auto_expanded =
-          nodes
-          |> Enum.filter(&(&1.kind == :module))
-          |> Enum.map(& &1.id)
-          |> MapSet.new()
+          case modules do
+            [single] -> MapSet.new([single.id])
+            _ -> MapSet.new()
+          end
           |> MapSet.union(dir_ids)
 
         expanded = MapSet.union(auto_expanded, expanded_from_params)
@@ -260,7 +262,7 @@ defmodule PlasticWeb.EditorLive do
         <span :if={!@expandable} class="w-4" />
 
         <!-- kind badge -->
-        <span class={["inline-block px-1.5 py-0.5 rounded text-xs font-semibold leading-none", kind_class(@node.kind)]}>
+        <span :if={kind_label(@node)} class={["inline-block px-1.5 py-0.5 rounded text-xs font-semibold leading-none", kind_class(@node.kind)]}>
           {kind_label(@node)}
         </span>
 
@@ -270,7 +272,11 @@ defmodule PlasticWeb.EditorLive do
           phx-click={if(@expandable, do: "toggle_node")}
           phx-value-id={@node.id}
         >
-          {@node.name}
+          <%= if @node.kind == :expression do %>
+            {highlight_inline(@node.name)}
+          <% else %>
+            {@node.name}
+          <% end %>
         </span>
 
         <!-- line number -->
@@ -289,11 +295,13 @@ defmodule PlasticWeb.EditorLive do
           {render_markdown(@node.meta.doc_text)}
         </div>
         <!-- source code preview (leaf nodes without special rendering) -->
-        <pre
+        <div
           :if={@node.kind != :moduledoc && @node.ast && !@has_children}
           style={"padding-left: #{(@depth + 1) * 16}px"}
-          class="text-xs text-base-content/60 bg-base-200/50 rounded p-2 my-1 overflow-x-auto whitespace-pre-wrap"
-        >{node_source(@node)}</pre>
+          class="text-xs rounded my-1 overflow-x-auto [&_pre]:!p-2 [&_pre]:!rounded [&_pre]:!m-0"
+        >
+          {highlight_block(node_source(@node))}
+        </div>
         <!-- children -->
         <.ast_node :for={child <- @node.children} node={child} expanded={@expanded} depth={@depth + 1} />
       </div>
@@ -303,6 +311,30 @@ defmodule PlasticWeb.EditorLive do
 
   defp node_source(%{ast: ast}) when ast != nil do
     Macro.to_string(ast)
+  end
+
+  defp highlight_block(code) do
+    case Lumis.highlight(code, language: "elixir") do
+      {:ok, html} -> Phoenix.HTML.raw(html)
+      _ -> code
+    end
+  end
+
+  defp highlight_inline(code) do
+    case Lumis.highlight(code, language: "elixir") do
+      {:ok, html} ->
+        # Strip the outer <pre><code>...</code></pre> wrapper to get just the spans
+        html
+        |> String.replace(~r/<pre[^>]*><code[^>]*>/, "")
+        |> String.replace(~r/<\/code><\/pre>/, "")
+        |> String.replace(~r/<div class="line"[^>]*>/, "")
+        |> String.replace("</div>", "")
+        |> String.trim()
+        |> Phoenix.HTML.raw()
+
+      _ ->
+        code
+    end
   end
 
   defp render_markdown(text) do
@@ -335,7 +367,21 @@ defmodule PlasticWeb.EditorLive do
   defp kind_label(%{kind: :import}), do: "import"
   defp kind_label(%{kind: :alias}), do: "alias"
   defp kind_label(%{kind: :require}), do: "require"
-  defp kind_label(%{kind: :expression}), do: "expr"
+  defp kind_label(%{kind: :pipe}), do: nil
+  defp kind_label(%{kind: :match}), do: nil
+  defp kind_label(%{kind: :case_expr}), do: "case"
+  defp kind_label(%{kind: :if_expr}), do: "if"
+  defp kind_label(%{kind: :unless_expr}), do: "unless"
+  defp kind_label(%{kind: :cond_expr}), do: "cond"
+  defp kind_label(%{kind: :with_expr}), do: "with"
+  defp kind_label(%{kind: :try_expr}), do: "try"
+  defp kind_label(%{kind: :receive_expr}), do: "receive"
+  defp kind_label(%{kind: :for_expr}), do: "for"
+  defp kind_label(%{kind: :fn_expr}), do: "fn"
+  defp kind_label(%{kind: :clause}), do: "->"
+  defp kind_label(%{kind: :block, name: name}), do: name
+  defp kind_label(%{kind: :with_clause}), do: "<-"
+  defp kind_label(%{kind: :expression}), do: nil
   defp kind_label(_), do: "?"
 
   defp kind_class(:defstruct), do: "bg-cyan-500/20 text-cyan-400"
@@ -353,6 +399,20 @@ defmodule PlasticWeb.EditorLive do
   defp kind_class(:import), do: "bg-orange-500/20 text-orange-400"
   defp kind_class(:alias), do: "bg-orange-500/20 text-orange-400"
   defp kind_class(:require), do: "bg-orange-500/20 text-orange-400"
+  defp kind_class(:pipe), do: "bg-sky-500/20 text-sky-400"
+  defp kind_class(:match), do: "bg-slate-500/20 text-slate-400"
+  defp kind_class(:case_expr), do: "bg-rose-500/20 text-rose-400"
+  defp kind_class(:if_expr), do: "bg-rose-500/20 text-rose-400"
+  defp kind_class(:unless_expr), do: "bg-rose-500/20 text-rose-400"
+  defp kind_class(:cond_expr), do: "bg-rose-500/20 text-rose-400"
+  defp kind_class(:with_expr), do: "bg-rose-500/20 text-rose-400"
+  defp kind_class(:try_expr), do: "bg-rose-500/20 text-rose-400"
+  defp kind_class(:receive_expr), do: "bg-rose-500/20 text-rose-400"
+  defp kind_class(:for_expr), do: "bg-rose-500/20 text-rose-400"
+  defp kind_class(:fn_expr), do: "bg-blue-500/20 text-blue-400"
+  defp kind_class(:clause), do: "bg-base-300 text-base-content/60"
+  defp kind_class(:block), do: "bg-base-300 text-base-content/60"
+  defp kind_class(:with_clause), do: "bg-base-300 text-base-content/60"
   defp kind_class(:expression), do: "bg-base-300 text-base-content/60"
   defp kind_class(_), do: "bg-base-300 text-base-content/60"
 end
