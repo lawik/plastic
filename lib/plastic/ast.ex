@@ -122,7 +122,12 @@ defmodule Plastic.AST do
   defp analyze_expression({:@, meta, [{attr_name, _, attr_args}]} = ast, prefix, idx) do
     kind = categorize_attribute(attr_name)
     id = "#{prefix}/#{kind}:#{attr_name}:#{idx}"
-    label = attribute_label(attr_name, attr_args)
+
+    label =
+      case kind do
+        :typespec -> typespec_label(attr_args)
+        _ -> attribute_label(attr_name, attr_args)
+      end
 
     [
       %Node{
@@ -137,15 +142,14 @@ defmodule Plastic.AST do
     ]
   end
 
-  defp analyze_expression({directive, meta, args} = ast, prefix, idx)
-       when directive in [:use, :import, :alias, :require] do
-    label = directive_label(args)
-    id = "#{prefix}/#{directive}:#{idx}"
+  defp analyze_expression({:defstruct, meta, [fields]} = ast, prefix, idx) do
+    label = struct_label(fields)
+    id = "#{prefix}/defstruct:#{idx}"
 
     [
       %Node{
         id: id,
-        kind: directive,
+        kind: :defstruct,
         name: label,
         meta: extract_meta(meta),
         ast: ast,
@@ -155,11 +159,46 @@ defmodule Plastic.AST do
     ]
   end
 
+  defp analyze_expression({guard_kind, meta, [{:when, _, [{name, _, args}, _guard]}]} = ast, prefix, idx)
+       when guard_kind in [:defguard, :defguardp] do
+    arity = if is_list(args), do: length(args), else: 0
+    label = "#{name}/#{arity}"
+    id = "#{prefix}/#{guard_kind}:#{name}/#{arity}:#{idx}"
+
+    [
+      %Node{
+        id: id,
+        kind: guard_kind,
+        name: label,
+        meta: extract_meta(meta),
+        ast: ast,
+        children: [],
+        collapsed: true
+      }
+    ]
+  end
+
+  defp analyze_expression({directive, meta, args} = ast, prefix, idx)
+       when directive in [:use, :import, :alias, :require] do
+    label = directive_label(args)
+    id = "#{prefix}/#{directive}:#{idx}"
+    has_options = length(args) > 1
+
+    [
+      %Node{
+        id: id,
+        kind: directive,
+        name: label,
+        meta: extract_meta(meta),
+        ast: if(has_options, do: ast),
+        children: [],
+        collapsed: true
+      }
+    ]
+  end
+
   defp analyze_expression(ast, prefix, idx) do
-    label =
-      ast
-      |> Macro.to_string()
-      |> String.slice(0, 60)
+    label = Macro.to_string(ast)
 
     id = "#{prefix}/expr:#{idx}"
 
@@ -235,7 +274,7 @@ defmodule Plastic.AST do
       clauses
       |> Enum.with_index()
       |> Enum.map(fn {%Node{} = clause, i} ->
-        %Node{clause | name: "clause #{i + 1}", id: "#{id}:clause:#{i}"}
+        %Node{clause | name: clause_label(clause.ast), id: "#{id}:clause:#{i}"}
       end)
 
     %Node{
@@ -253,15 +292,54 @@ defmodule Plastic.AST do
     %Node{clause | kind: :function}
   end
 
+  # Extract a readable clause signature from the def AST
+  defp clause_label({_def_kind, _, [{:when, _, [{name, _, args}, guard]} | _]}) do
+    args_str = args_to_string(args)
+    guard_str = Macro.to_string(guard)
+    "#{name}(#{args_str}) when #{guard_str}"
+  end
+
+  defp clause_label({_def_kind, _, [{name, _, args} | _]}) do
+    args_str = args_to_string(args)
+    "#{name}(#{args_str})"
+  end
+
+  defp clause_label(_), do: "?"
+
+  defp args_to_string(nil), do: ""
+  defp args_to_string([]), do: ""
+
+  defp args_to_string(args) when is_list(args) do
+    Enum.map_join(args, ", ", fn arg ->
+      Macro.to_string(arg)
+    end)
+  end
+
+  defp typespec_label(nil), do: ""
+
+  defp typespec_label([value]) do
+    Macro.to_string(value)
+  end
+
+  defp typespec_label(_), do: ""
+
+  defp struct_label(fields) when is_list(fields) do
+    parts =
+      Enum.map(fields, fn
+        {key, value} when is_atom(key) -> "#{key}: #{Macro.to_string(value)}"
+        key when is_atom(key) -> "#{key}"
+        other -> Macro.to_string(other)
+      end)
+
+    Enum.join(parts, ", ")
+  end
+
+  defp struct_label(_), do: ""
+
   defp attribute_label(attr_name, nil), do: "#{attr_name}"
 
   defp attribute_label(attr_name, [value]) do
-    value_str =
-      value
-      |> Macro.to_string()
-      |> String.slice(0, 40)
-
-    "#{attr_name} #{value_str}"
+    "#{attr_name} #{Macro.to_string(value)}"
   end
 
   defp attribute_label(attr_name, _), do: "#{attr_name}"

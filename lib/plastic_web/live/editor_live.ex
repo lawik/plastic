@@ -22,8 +22,17 @@ defmodule PlasticWeb.EditorLive do
   end
 
   @impl true
-  def handle_params(%{"path" => path}, _uri, socket) do
-    {:noreply, open_file(socket, path)}
+  def handle_params(%{"path" => path} = params, _uri, socket) do
+    expanded_from_params = parse_expanded(params)
+
+    socket =
+      if socket.assigns.selected_file == path do
+        assign(socket, expanded: expanded_from_params)
+      else
+        open_file(socket, path, expanded_from_params)
+      end
+
+    {:noreply, socket}
   end
 
   def handle_params(_params, _uri, socket) do
@@ -32,47 +41,44 @@ defmodule PlasticWeb.EditorLive do
 
   @impl true
   def handle_event("select_file", %{"path" => path}, socket) do
-    {:noreply, push_patch(socket, to: ~p"/?#{%{path: path}}")}
+    dir_ids = parent_dir_ids(path)
+    {:noreply, patch_with_expanded(socket, path, dir_ids)}
   end
 
   def handle_event("toggle_node", %{"id" => id}, socket) do
-    expanded =
-      if MapSet.member?(socket.assigns.expanded, id) do
-        MapSet.delete(socket.assigns.expanded, id)
-      else
-        MapSet.put(socket.assigns.expanded, id)
-      end
-
-    {:noreply, assign(socket, expanded: expanded)}
+    expanded = toggle_in_set(socket.assigns.expanded, id)
+    {:noreply, patch_with_expanded(socket, socket.assigns.selected_file, expanded)}
   end
 
   def handle_event("toggle_dir", %{"path" => path}, socket) do
-    expanded =
-      if MapSet.member?(socket.assigns.expanded, "dir:" <> path) do
-        MapSet.delete(socket.assigns.expanded, "dir:" <> path)
-      else
-        MapSet.put(socket.assigns.expanded, "dir:" <> path)
-      end
-
-    {:noreply, assign(socket, expanded: expanded)}
+    expanded = toggle_in_set(socket.assigns.expanded, "dir:" <> path)
+    {:noreply, patch_with_expanded(socket, socket.assigns.selected_file, expanded)}
   end
 
   def handle_event("expand_all", _, socket) do
-    ids = collect_all_node_ids(socket.assigns.ast_tree || [])
-    {:noreply, assign(socket, expanded: MapSet.new(ids))}
+    all_ids = collect_all_node_ids(socket.assigns.ast_tree || [])
+    expanded = MapSet.union(socket.assigns.expanded, MapSet.new(all_ids))
+    {:noreply, patch_with_expanded(socket, socket.assigns.selected_file, expanded)}
   end
 
   def handle_event("collapse_all", _, socket) do
-    {:noreply, assign(socket, expanded: MapSet.new())}
+    # Keep dir expansions, clear AST node expansions
+    dirs = socket.assigns.expanded |> Enum.filter(&String.starts_with?(&1, "dir:")) |> MapSet.new()
+    {:noreply, patch_with_expanded(socket, socket.assigns.selected_file, dirs)}
   end
 
-  defp collect_all_node_ids(nodes) do
-    Enum.flat_map(nodes, fn node ->
-      [node.id | collect_all_node_ids(node.children)]
-    end)
+  defp toggle_in_set(set, id) do
+    if MapSet.member?(set, id), do: MapSet.delete(set, id), else: MapSet.put(set, id)
   end
 
-  defp open_file(socket, path) do
+  defp patch_with_expanded(socket, nil, _expanded), do: push_patch(socket, to: ~p"/")
+
+  defp patch_with_expanded(socket, path, expanded) do
+    params = %{path: path, expanded: encode_expanded(expanded)}
+    push_patch(socket, to: ~p"/?#{params}", replace: true)
+  end
+
+  defp open_file(socket, path, expanded_from_params) do
     abs_path = Path.join(socket.assigns.project.root_path, path)
     dir_ids = parent_dir_ids(path)
 
@@ -80,12 +86,14 @@ defmodule PlasticWeb.EditorLive do
       {:ok, ast} ->
         nodes = AST.analyze(ast)
 
-        expanded =
+        auto_expanded =
           nodes
           |> Enum.filter(&(&1.kind == :module))
           |> Enum.map(& &1.id)
           |> MapSet.new()
           |> MapSet.union(dir_ids)
+
+        expanded = MapSet.union(auto_expanded, expanded_from_params)
 
         assign(socket,
           selected_file: path,
@@ -99,7 +107,7 @@ defmodule PlasticWeb.EditorLive do
           selected_file: path,
           ast_tree: nil,
           parse_error: inspect(reason),
-          expanded: dir_ids
+          expanded: MapSet.union(dir_ids, expanded_from_params)
         )
     end
   end
@@ -112,6 +120,24 @@ defmodule PlasticWeb.EditorLive do
     |> Enum.map(&("dir:" <> &1))
     |> MapSet.new()
   end
+
+  defp collect_all_node_ids(nodes) do
+    Enum.flat_map(nodes, fn node ->
+      [node.id | collect_all_node_ids(node.children)]
+    end)
+  end
+
+  defp encode_expanded(expanded) do
+    expanded |> MapSet.to_list() |> Enum.join(",")
+  end
+
+  defp parse_expanded(%{"expanded" => ""}), do: MapSet.new()
+
+  defp parse_expanded(%{"expanded" => str}) when is_binary(str) do
+    str |> String.split(",", trim: true) |> MapSet.new()
+  end
+
+  defp parse_expanded(_), do: MapSet.new()
 
   @impl true
   def render(assigns) do
@@ -216,21 +242,22 @@ defmodule PlasticWeb.EditorLive do
   defp ast_node(assigns) do
     has_children = assigns.node.children != []
     is_expanded = MapSet.member?(assigns.expanded, assigns.node.id)
-    assigns = assign(assigns, has_children: has_children, is_expanded: is_expanded)
+    expandable = has_children or assigns.node.ast != nil
+    assigns = assign(assigns, has_children: has_children, is_expanded: is_expanded, expandable: expandable)
 
     ~H"""
     <div style={"padding-left: #{@depth * 16}px"}>
       <div class="flex items-center gap-1.5 py-0.5 group">
         <!-- expand toggle -->
         <button
-          :if={@has_children}
+          :if={@expandable}
           phx-click="toggle_node"
           phx-value-id={@node.id}
           class="w-4 text-center text-base-content/40 hover:text-base-content cursor-pointer"
         >
           {if @is_expanded, do: "▼", else: "▶"}
         </button>
-        <span :if={!@has_children} class="w-4" />
+        <span :if={!@expandable} class="w-4" />
 
         <!-- kind badge -->
         <span class={["inline-block px-1.5 py-0.5 rounded text-xs font-semibold leading-none", kind_class(@node.kind)]}>
@@ -239,8 +266,8 @@ defmodule PlasticWeb.EditorLive do
 
         <!-- name -->
         <span
-          class={["truncate", if(@has_children, do: "cursor-pointer hover:underline", else: "")]}
-          phx-click={if(@has_children, do: "toggle_node")}
+          class={["break-all", if(@expandable, do: "cursor-pointer hover:underline", else: "")]}
+          phx-click={if(@expandable, do: "toggle_node")}
           phx-value-id={@node.id}
         >
           {@node.name}
@@ -252,11 +279,37 @@ defmodule PlasticWeb.EditorLive do
         </span>
       </div>
 
-      <div :if={@has_children && @is_expanded}>
+      <div :if={@is_expanded}>
+        <!-- moduledoc rendered preview -->
+        <div
+          :if={@node.kind == :moduledoc && @node.meta[:doc_text]}
+          style={"padding-left: #{(@depth + 1) * 16}px"}
+          class="text-sm bg-base-200/50 rounded p-3 my-1 prose prose-sm max-w-none"
+        >
+          {render_markdown(@node.meta.doc_text)}
+        </div>
+        <!-- source code preview (leaf nodes without special rendering) -->
+        <pre
+          :if={@node.kind != :moduledoc && @node.ast && !@has_children}
+          style={"padding-left: #{(@depth + 1) * 16}px"}
+          class="text-xs text-base-content/60 bg-base-200/50 rounded p-2 my-1 overflow-x-auto whitespace-pre-wrap"
+        >{node_source(@node)}</pre>
+        <!-- children -->
         <.ast_node :for={child <- @node.children} node={child} expanded={@expanded} depth={@depth + 1} />
       </div>
     </div>
     """
+  end
+
+  defp node_source(%{ast: ast}) when ast != nil do
+    Macro.to_string(ast)
+  end
+
+  defp render_markdown(text) do
+    case MDEx.to_html(text) do
+      {:ok, html} -> Phoenix.HTML.raw(html)
+      _ -> text
+    end
   end
 
   defp kind_label(%{kind: kind, meta: meta}) when kind in [:function, :function_clause, :callback_impl] do
@@ -269,10 +322,14 @@ defmodule PlasticWeb.EditorLive do
     end
   end
 
+  defp kind_label(%{kind: :defstruct}), do: "struct"
+  defp kind_label(%{kind: :defguard}), do: "defguard"
+  defp kind_label(%{kind: :defguardp}), do: "defguardp"
   defp kind_label(%{kind: :module}), do: "module"
   defp kind_label(%{kind: :moduledoc}), do: "moduledoc"
   defp kind_label(%{kind: :behaviour}), do: "behaviour"
   defp kind_label(%{kind: :attribute}), do: "attr"
+  defp kind_label(%{kind: :typespec, meta: %{attr_name: name}}), do: "#{name}"
   defp kind_label(%{kind: :typespec}), do: "type"
   defp kind_label(%{kind: :use}), do: "use"
   defp kind_label(%{kind: :import}), do: "import"
@@ -281,6 +338,9 @@ defmodule PlasticWeb.EditorLive do
   defp kind_label(%{kind: :expression}), do: "expr"
   defp kind_label(_), do: "?"
 
+  defp kind_class(:defstruct), do: "bg-cyan-500/20 text-cyan-400"
+  defp kind_class(:defguard), do: "bg-amber-500/20 text-amber-400"
+  defp kind_class(:defguardp), do: "bg-amber-500/20 text-amber-400"
   defp kind_class(:module), do: "bg-purple-500/20 text-purple-400"
   defp kind_class(:function), do: "bg-blue-500/20 text-blue-400"
   defp kind_class(:function_clause), do: "bg-blue-500/20 text-blue-400"

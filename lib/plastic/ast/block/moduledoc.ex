@@ -5,9 +5,11 @@ defmodule Plastic.AST.Block.Moduledoc do
   alias Plastic.AST.Node
 
   @impl true
-  def match([%Node{kind: :attribute, meta: %{attr_name: :moduledoc}} = node | rest]) do
+  def match([%Node{kind: :attribute, meta: %{attr_name: :moduledoc}, ast: ast} = node | rest]) do
     name = strip_attr_prefix(node.name, "moduledoc")
-    {:ok, %Node{node | kind: :moduledoc, name: name}, rest}
+    doc_text = extract_doc_text(ast)
+    meta = Map.put(node.meta, :doc_text, doc_text)
+    {:ok, %Node{node | kind: :moduledoc, name: name, meta: meta}, rest}
   end
 
   def match(_nodes), do: :skip
@@ -19,4 +21,7 @@ defmodule Plastic.AST.Block.Moduledoc do
       other -> other
     end
   end
+
+  defp extract_doc_text({:@, _, [{:moduledoc, _, [text]}]}) when is_binary(text), do: text
+  defp extract_doc_text(_), do: nil
 end
